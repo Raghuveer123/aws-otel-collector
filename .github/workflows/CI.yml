@@ -21,9 +21,11 @@ on:
       - test/*
     paths-ignore:
       - '.github/**'
+      - '!.github/config/testcases.json'
       - '!.github/workflows/CI.yml'
       - '!.github/workflows/CI-Operator.yml'
       - '**.md'
+      - 'tools/workflow/**'
 
   # from collector and contrib repo
   repository_dispatch:
@@ -48,7 +50,7 @@ env:
   DDB_TABLE_NAME: BatchTestCache
   MAX_JOBS: 110
   BATCH_INCLUDED_SERVICES: EKS,ECS,EC2,EKS_ARM64,EKS_FARGATE
-  GO_VERSION: ~1.20.3
+  GO_VERSION: ~1.20.8
 
 
 concurrency:
@@ -60,8 +62,33 @@ permissions:
   contents: read
 
 jobs:
+  validate-markdown:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install markdown-link-check
+        run: npm install -g markdown-link-check
+
+      - name: Run markdown-link-check in the developers docs
+        run: |
+          find ./docs/developers -name "*.md" | xargs markdown-link-check \
+            --verbose \
+            --config .github/config/markdown-links-config.json \
+            || { echo "Check that anchor links are lowercase"; exit 1; }
+      - name: Run markdown-link-check on main documentation
+        run: |
+          markdown-link-check \
+          --verbose \
+          --config .github/config/markdown-links-config.json \
+          README.md CONTRIBUTING.md CODE_OF_CONDUCT.md \
+          || { echo "Check that anchor links are lowercase"; exit 1; } 
+
   create-test-ref:
     runs-on: ubuntu-latest
+    needs: validate-markdown
     outputs:
       testRef: ${{ steps.setRef.outputs.ref }}
     steps:
@@ -79,7 +106,7 @@ jobs:
     needs: create-test-ref
     steps:
       - name: Check out testing framework
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: ${{ env.TESTING_FRAMEWORK_REPO }}
           path: testing-framework
@@ -88,6 +115,7 @@ jobs:
         uses: actions/setup-go@v4
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: testing-framework/cmd/aotutil/go.sum
       - name: Build aotutil
         run: cd testing-framework/cmd/aotutil && make build
       - name: Cache aotutil
@@ -102,17 +130,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+    - uses: actions/checkout@v4
+
+    - name: apply patches
+      run: make apply-patches
+
     # Set up building environment, patch the dev repo code on dispatch events.
     - name: Set up Go 1.x
       uses: actions/setup-go@v4
       with:
         go-version: ${{ env.GO_VERSION }}
 
-    - uses: actions/checkout@v3
-
     - name: Checkout dev opentelemetry-collector-contrib
       if: github.event_name == 'repository_dispatch' && github.event.action == 'dependency-build'
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         repository: ${{ github.repository_owner }}/opentelemetry-collector-contrib
         ref: main
@@ -120,7 +151,7 @@ jobs:
 
     - name: Checkout dev opentelemetry-collector
       if: github.event_name == 'repository_dispatch' && github.event.action == 'dependency-build'
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         repository: ${{ github.repository_owner }}/opentelemetry-collector
         ref: main
@@ -133,20 +164,6 @@ jobs:
         echo "replace go.opentelemetry.io/collector => ./pkg/opentelemetry-collector" >> go.mod
         cat go.mod
         ls pkg
-    #Cache go build and dependencies before making unit testing and build
-    #Samples codes for different OS: https://github.com/actions/cache/blob/main/examples.md#go---modules
-    #Since we are using Linux, the go packages are in /go/pkg/mod and build are in /.cache/go-build
-    #Also speed up unit testing since go test uses the go build cache and also speed up the go build.
-    - name: Cache go
-      id: cached_go
-      uses: actions/cache@v3
-      env:
-        cache-name: cached_go_modules
-      with:
-        path: |
-          ~/go/pkg/mod
-          ~/.cache/go-build
-        key: v1-go-pkg-mod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
 
     - name: Cache binaries
       id: cached_binaries
@@ -177,12 +194,13 @@ jobs:
       with:
         name: binary_artifacts
         path: build
+        retention-days: 1
 
   packaging-msi:
     needs: build
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Download built artifacts
         uses: actions/download-artifact@v3
@@ -202,7 +220,7 @@ jobs:
           msiexec.exe /i AWSCLIV2.msi /passive
           [System.Environment]::SetEnvironmentVariable('Path',$Env:Path + ";C:\\Program Files\\Amazon\\AWSCLIV2",'User')
 
-      - uses: aws-actions/configure-aws-credentials@v1-node16
+      - uses: aws-actions/configure-aws-credentials@v3
         with:
           role-to-assume: ${{ secrets.COLLECTOR_PROD_PKG_SIGNER_ROLE_ARN }}
           aws-region: us-west-2
@@ -245,13 +263,14 @@ jobs:
         with:
           name: msi_artifacts
           path: "${{ env.PACKAGING_ROOT }}"
+          retention-days: 1
 
   packaging-rpm:
     runs-on: ubuntu-latest
     needs: build
     steps:
       # Build and archive rpms into cache.
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Cache rpms
         id: cached_rpms
@@ -276,7 +295,7 @@ jobs:
           ARCH=x86_64 SOURCE_ARCH=amd64 DEST=$PACKAGING_ROOT/linux/amd64 tools/packaging/linux/create_rpm.sh
           ARCH=aarch64 SOURCE_ARCH=arm64 DEST=$PACKAGING_ROOT/linux/arm64 tools/packaging/linux/create_rpm.sh
 
-      - uses: aws-actions/configure-aws-credentials@v1-node16
+      - uses: aws-actions/configure-aws-credentials@v3
         with:
           role-to-assume: ${{ secrets.COLLECTOR_PROD_PKG_SIGNER_ROLE_ARN }}
           aws-region: us-west-2
@@ -311,7 +330,7 @@ jobs:
     needs: build
     steps:
       # Build and archive debs into cache.
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Cache Debs
         id: cached_debs
@@ -333,7 +352,7 @@ jobs:
           ARCH=amd64 DEST=$PACKAGING_ROOT/debian/amd64 tools/packaging/debian/create_deb.sh
           ARCH=arm64 DEST=$PACKAGING_ROOT/debian/arm64 tools/packaging/debian/create_deb.sh
       
-      - uses: aws-actions/configure-aws-credentials@v1-node16
+      - uses: aws-actions/configure-aws-credentials@v3
         with:
           role-to-assume: ${{ secrets.COLLECTOR_PROD_PKG_SIGNER_ROLE_ARN }}
           aws-region: us-west-2
@@ -360,12 +379,33 @@ jobs:
         run: |
           gpg --fingerprint --with-colons aws-otel-collector@amazon.com grep "^fpr" | sed -n 's/^fpr:::::::::\([[:alnum:]]\+\):/\1/p' | xargs gpg --batch --yes --delete-secret-keys
           gpg --list-secret-keys
+
+  test-control-stript:
+    runs-on: ubuntu-latest
+    needs: [packaging-deb]
+    steps:
+      - name: Checkout
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/checkout@v4
+
+      - name: Restore cached Debs
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        uses: actions/cache@v3
+        with:
+          key: "cached_debs_${{ github.run_id }}"
+          path: ${{ env.PACKAGING_ROOT }}
+
+      - name: Execute tests
+        if: ${{ needs.changes.outputs.changed == 'true' }}
+        run: |
+          sudo ./.github/scripts/test-collector-ctl.sh $PACKAGING_ROOT/debian/amd64/aws-otel-collector.deb ./config.yaml
+
   packaging-ssm:
     runs-on: ubuntu-latest
     needs: [packaging-rpm, packaging-deb, packaging-msi]
     steps:
       # Build and archive SSM package into cache.
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Cache SSM files
         id: cached_ssm
@@ -411,7 +451,7 @@ jobs:
       version: ${{ steps.versioning.outputs.version }}
     steps:
       # Archive all the packages into one, and build a unique version number for e2etesting
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Cache the packages
         id: cached_packages
@@ -465,7 +505,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [e2etest-preparation]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Cache if success
         id: e2etest-release
@@ -489,7 +529,7 @@ jobs:
           path: build
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1-node16
+        uses: aws-actions/configure-aws-credentials@v3
         with:
           role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
           aws-region: us-west-2
@@ -557,26 +597,30 @@ jobs:
       test-case-batch-value: ${{ steps.set-batches.outputs.batch-values }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: ${{ env.TESTING_FRAMEWORK_REPO }}
           path: testing-framework
           ref: ${{ needs.create-test-ref.outputs.testRef }}
 
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: aws-otel-collector
+          ref: ${{ github.ref_name }}
+
       - name: Set up Go 1.x
         uses: actions/setup-go@v4
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: testing-framework/tools/batchTestGenerator/go.sum
 
-        # getting the batches would look something like this
-        # max jobs could be read as env or passed in as arg depending
-        # on how tool is written. 
       - name: Create test batch key values
         id: set-batches
         run: |
           cd testing-framework/tools/batchTestGenerator
           go build
-          ./batchTestGenerator github --testCaseFilePath=./testcases.json --maxBatch=${{ env.MAX_JOBS }} \
+          ./batchTestGenerator github --testCaseFilePath=$GITHUB_WORKSPACE/aws-otel-collector/.github/config/testcases.json --maxBatch=${{ env.MAX_JOBS }} \
             --include=${{ env.BATCH_INCLUDED_SERVICES }}
       - name: List testing suites
         run: |
@@ -600,11 +644,11 @@ jobs:
       - name: Set up terraform
         uses: hashicorp/setup-terraform@v2
         with:
-          terraform_version: "~1.4"
+          terraform_version: "~1.5"
 
       - name: Configure AWS Credentials
         if: steps.e2etest-eks.outputs.cache-hit != 'true'
-        uses: aws-actions/configure-aws-credentials@v1-node16
+        uses: aws-actions/configure-aws-credentials@v3
         with:
           role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
           aws-region: us-west-2
@@ -612,7 +656,7 @@ jobs:
           role-duration-seconds: 21600
       
       - name: Checkout testing framework
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: ${{ env.TESTING_FRAMEWORK_REPO }}
           path: testing-framework
@@ -665,9 +709,9 @@ jobs:
     if: ${{ always() && needs.e2etest-preparation.result == 'success' }}
     needs: [run-batch-job,e2etest-preparation]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1-node16
+        uses: aws-actions/configure-aws-credentials@v3
         with:
           role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
           aws-region: us-west-2
@@ -701,7 +745,7 @@ jobs:
     if: always()
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: ${{ env.TESTING_FRAMEWORK_REPO }}
           path: testing-framework
@@ -713,7 +757,7 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1-node16
+        uses: aws-actions/configure-aws-credentials@v3
         with:
           role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
           aws-region: us-west-2
@@ -734,11 +778,12 @@ jobs:
 
   release-candidate:
     runs-on: ubuntu-latest
-    if: ${{ always() && needs.validate-all-tests-pass.result == 'success' }}
+    if: ${{ always() && needs.validate-all-tests-pass.result == 'success'
+            && (startsWith(github.ref_name, 'release/v') || github.ref_name == 'main') }}
     needs: validate-all-tests-pass
     steps:
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1-node16
+        uses: aws-actions/configure-aws-credentials@v3
         with:
           role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
           aws-region: us-west-2
@@ -775,7 +820,7 @@ jobs:
     if: always()
     steps:
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1-node16
+        uses: aws-actions/configure-aws-credentials@v3
         with:
           role-to-assume: ${{ secrets.COLLECTOR_ASSUMABLE_ROLE_ARN }}
           aws-region: us-west-2
